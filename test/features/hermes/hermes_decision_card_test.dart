@@ -3,7 +3,10 @@ import 'package:conduit_core/models/chat_message.dart';
 import 'package:conduit_core/models/conversation.dart';
 import 'package:conduit_core/providers/app_providers.dart';
 import 'package:conduit_core/features/chat/providers/chat_providers.dart';
+import 'package:conduit_core/features/hermes/models/hermes_config.dart';
 import 'package:conduit_core/features/hermes/models/hermes_run_event.dart';
+import 'package:conduit_core/features/hermes/providers/hermes_providers.dart';
+import 'package:conduit_core/features/hermes/services/hermes_api_service.dart';
 import 'package:conduit_core/features/hermes/services/hermes_run_transport.dart';
 import 'package:conduit/features/hermes/widgets/hermes_decision_card.dart';
 import 'package:conduit/features/hermes/widgets/hermes_message_interactions.dart';
@@ -12,6 +15,7 @@ import 'package:conduit/l10n/conduit_localizations.dart';
 import 'package:conduit/shared/theme/app_theme.dart';
 import 'package:conduit/shared/theme/tweakcn_themes.dart';
 import 'package:cupertino_ui/cupertino_ui.dart';
+import 'package:dio/dio.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -76,6 +80,52 @@ void main() {
       findPendingHermesComposerPrompt([approval, decision]),
       same(decision),
     );
+  });
+
+  test('selects a run-scoped clarify prompt without a Desktop session', () {
+    final decision = ChatMessage(
+      id: 'decision',
+      role: 'assistant',
+      content: '',
+      timestamp: DateTime(2026),
+      metadata: {
+        'transport': kHermesTransport,
+        kHermesDecisionMeta: {
+          'state': 'pending',
+          'kind': 'clarification',
+          'requestId': 'clr-1',
+          'runtimeId': 'run-1',
+          'runScoped': true,
+          'prompt': 'Which host?',
+          'expiresAt': DateTime.now()
+              .add(const Duration(minutes: 3))
+              .toUtc()
+              .toIso8601String(),
+        },
+      },
+    );
+
+    // The runs API answers a clarify gate with the run that parked on it, so
+    // no stored Desktop session is required to present the card.
+    expect(findPendingHermesComposerPrompt([decision]), same(decision));
+
+    final desktopShaped = decision.copyWith(
+      metadata: {
+        'transport': kHermesTransport,
+        kHermesDecisionMeta: {
+          'state': 'pending',
+          'kind': 'clarification',
+          'requestId': 'clr-1',
+          'runtimeId': 'run-1',
+          'expiresAt': DateTime.now()
+              .add(const Duration(minutes: 3))
+              .toUtc()
+              .toIso8601String(),
+        },
+      },
+    );
+    // A decision without either scope cannot be answered, so it stays hidden.
+    expect(findPendingHermesComposerPrompt([desktopShaped]), isNull);
   });
 
   test('skips incomplete and archived newer Hermes prompts', () {
@@ -433,4 +483,140 @@ void main() {
     await tester.pump();
     expect(answer, '["alpha","beta"]');
   });
+
+  testWidgets('a run-scoped clarify card answers the run that parked on it', (
+    tester,
+  ) async {
+    final interceptor = _ClarifyCaptureInterceptor();
+    final service = HermesApiService(
+      config: const HermesConfig(
+        enabled: true,
+        baseUrl: 'http://host:8642',
+        apiKey: 'key',
+      ),
+      dio: Dio()..interceptors.add(interceptor),
+    );
+    final message = ChatMessage(
+      id: 'clarify',
+      role: 'assistant',
+      content: '',
+      timestamp: DateTime(2026),
+      metadata: {
+        'transport': kHermesTransport,
+        kHermesDecisionMeta: {
+          'state': 'pending',
+          'kind': HermesDecisionKind.clarification.name,
+          'prompt': 'Which host?',
+          'requestId': 'clr-1',
+          'runtimeId': 'run-1',
+          // A runs-API question carries no Desktop session and answers
+          // through POST /v1/runs/{id}/clarify instead.
+          'runScoped': true,
+          'executionGeneration': 7,
+          'expiresAt': clock
+              .now()
+              .add(const Duration(minutes: 3))
+              .toUtc()
+              .toIso8601String(),
+        },
+      },
+    );
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          activeConversationProvider.overrideWith(_DecisionConversation.new),
+          chatMessagesProvider.overrideWith(() => _DecisionMessages(const [])),
+          hermesApiServiceProvider.overrideWithValue(service),
+        ],
+        child: CupertinoApp(
+          localizationsDelegates: conduitLocalizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Theme(
+            data: AppTheme.light(TweakcnThemes.t3Chat),
+            child: HermesComposerPromptOverlay(message: message),
+          ),
+        ),
+      ),
+    );
+    expect(find.text('Which host?'), findsOneWidget);
+
+    await tester.enterText(find.byType(TextField), 'the laptop');
+    await tester.tap(find.text('Send response'));
+    await tester.pumpAndSettle();
+
+    final request = interceptor.requests.single;
+    expect(request.method, 'POST');
+    expect(request.path, 'http://host:8642/v1/runs/run-1/clarify');
+    expect(request.data as Map<String, dynamic>, {
+      'request_id': 'clr-1',
+      'execution_generation': 7,
+      'answer': 'the laptop',
+    });
+  });
+
+  testWidgets('a run-scoped card without a generation is not presented', (
+    tester,
+  ) async {
+    final message = ChatMessage(
+      id: 'clarify',
+      role: 'assistant',
+      content: '',
+      timestamp: DateTime(2026),
+      metadata: {
+        'transport': kHermesTransport,
+        kHermesDecisionMeta: {
+          'state': 'pending',
+          'kind': HermesDecisionKind.clarification.name,
+          'prompt': 'Unanswerable question',
+          'requestId': 'clr-1',
+          'runtimeId': 'run-1',
+          'runScoped': true,
+          'expiresAt': clock
+              .now()
+              .add(const Duration(minutes: 3))
+              .toUtc()
+              .toIso8601String(),
+        },
+      },
+    );
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          activeConversationProvider.overrideWith(_DecisionConversation.new),
+          chatMessagesProvider.overrideWith(() => _DecisionMessages(const [])),
+        ],
+        child: CupertinoApp(
+          localizationsDelegates: conduitLocalizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Theme(
+            data: AppTheme.light(TweakcnThemes.t3Chat),
+            child: HermesComposerPromptOverlay(message: message),
+          ),
+        ),
+      ),
+    );
+
+    // The runs API rejects a clarify answer without its generation, so the
+    // card fails closed rather than offering a tap that can never succeed.
+    expect(find.text('Unanswerable question'), findsNothing);
+    expect(find.byType(TextField), findsNothing);
+  });
+}
+
+class _ClarifyCaptureInterceptor extends Interceptor {
+  final List<RequestOptions> requests = [];
+
+  @override
+  void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
+    requests.add(options);
+    handler.resolve(
+      Response<dynamic>(
+        requestOptions: options,
+        data: const <String, dynamic>{},
+        statusCode: 200,
+      ),
+    );
+  }
 }

@@ -318,6 +318,8 @@ int _hermesEventCharacters(
     requestId.length +
         (prompt?.length ?? 0) +
         min(jsonEncode(raw).length, maxCharacters),
+  HermesDecisionSettled(:final requestId, :final outcome) =>
+    requestId.length + (outcome?.length ?? 0),
   HermesLifecycle(:final status) => status.length,
   HermesFinalOutput(:final text) => text.length,
   HermesComposerPrefill(:final text) => text.length,
@@ -1839,6 +1841,34 @@ class HermesApiService implements HermesBackendService, HermesTurnService {
         'approval_id': approvalId,
         'approved': approved,
         'decision': approved ? 'approve' : 'deny',
+      },
+    );
+  }
+
+  /// Answers a parked clarify question (`POST /v1/runs/{id}/clarify`).
+  ///
+  /// The runs API binds one answer to the exact prompt and execution
+  /// generation that opened it, and rejects any other body shape, so the
+  /// payload is precisely those three fields.
+  Future<void> resolveClarify(
+    String runId, {
+    required String requestId,
+    required String answer,
+    int? executionGeneration,
+  }) async {
+    if (executionGeneration == null) {
+      throw const FormatException(
+        'Hermes did not report the execution generation for this question.',
+      );
+    }
+    final encodedRunId = Uri.encodeComponent(_requireOpaqueIdentifier(runId));
+    await _requestAndConsumeBounded(
+      'POST',
+      '$_root/v1/runs/$encodedRunId/clarify',
+      data: {
+        'request_id': _requireOpaqueIdentifier(requestId),
+        'execution_generation': executionGeneration,
+        'answer': answer,
       },
     );
   }

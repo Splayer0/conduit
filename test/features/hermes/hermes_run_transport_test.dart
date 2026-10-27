@@ -1441,6 +1441,172 @@ void main() {
     check(completedUi).isTrue();
   });
 
+  test('dispatchHermesRun stores a run-scoped clarify gate', () async {
+    const raw = <String, dynamic>{
+      'event': 'clarify.request',
+      'run_id': 'run-1',
+      'kind': 'clarify',
+      'prompt_id': 'clr-1',
+      'execution_generation': 4,
+      'question': 'Which host?',
+      'choices': ['laptop', 'server'],
+      'multi_select': true,
+      'timeout_s': 180,
+    };
+    final fake = _FakeHermesApiService([
+      const HermesDecisionRequested(
+        kind: HermesDecisionKind.clarification,
+        requestId: 'clr-1',
+        prompt: 'Which host?',
+        raw: raw,
+      ),
+      const HermesRunDone(),
+    ]);
+    var message = ChatMessage(
+      id: 'm',
+      role: 'assistant',
+      content: '',
+      timestamp: DateTime.fromMillisecondsSinceEpoch(0),
+    );
+
+    await dispatchHermesRun(
+      service: fake,
+      registry: HermesRunRegistry(),
+      assistantMessageId: message.id,
+      input: 'hi',
+      appendContent: (_) {},
+      appendStatus: (_) {},
+      updateMessage: (updater) => message = updater(message),
+      finishStreaming: () {},
+      completeStreamingUi: () {},
+    );
+
+    final decision = message.metadata?[kHermesDecisionMeta] as Map?;
+    check(decision).isNotNull();
+    check(decision!['state']).equals('pending');
+    check(decision['kind']).equals('clarification');
+    // Run-scoped: answered over the runs API, not the Desktop channel.
+    check(decision['runScoped']).equals(true);
+    check(decision['requestId']).equals('clr-1');
+    check(decision['runtimeId']).equals(message.metadata?['hermesRunId']);
+    check(decision['executionGeneration']).equals(4);
+    check(decision['prompt']).equals('Which host?');
+    check(decision['choices'] as List).deepEquals(['laptop', 'server']);
+    check(decision['multiSelect']).equals(true);
+  });
+
+  test('dispatchHermesRun strips the clarify recommended marker', () async {
+    final fake = _FakeHermesApiService([
+      const HermesDecisionRequested(
+        kind: HermesDecisionKind.clarification,
+        requestId: 'clr-2',
+        prompt: 'Which colour?',
+        raw: {
+          'run_id': 'run-1',
+          'execution_generation': 2,
+          'choices': ['red (Recommended)', 'green'],
+        },
+      ),
+      const HermesRunDone(),
+    ]);
+    var message = ChatMessage(
+      id: 'm',
+      role: 'assistant',
+      content: '',
+      timestamp: DateTime.fromMillisecondsSinceEpoch(0),
+    );
+
+    await dispatchHermesRun(
+      service: fake,
+      registry: HermesRunRegistry(),
+      assistantMessageId: message.id,
+      input: 'hi',
+      appendContent: (_) {},
+      appendStatus: (_) {},
+      updateMessage: (updater) => message = updater(message),
+      finishStreaming: () {},
+      completeStreamingUi: () {},
+    );
+
+    final decision = message.metadata?[kHermesDecisionMeta] as Map?;
+    check(decision).isNotNull();
+    check(decision!['choices'] as List).deepEquals(['red', 'green']);
+  });
+
+  test('a settled clarify gate stops the card from staying pending', () async {
+    final fake = _FakeHermesApiService([
+      const HermesDecisionRequested(
+        kind: HermesDecisionKind.clarification,
+        requestId: 'clr-1',
+        prompt: 'Which host?',
+        raw: {'run_id': 'run-1', 'execution_generation': 4},
+      ),
+      const HermesDecisionSettled(requestId: 'clr-1'),
+      const HermesRunDone(),
+    ]);
+    var message = ChatMessage(
+      id: 'm',
+      role: 'assistant',
+      content: '',
+      timestamp: DateTime.fromMillisecondsSinceEpoch(0),
+    );
+
+    await dispatchHermesRun(
+      service: fake,
+      registry: HermesRunRegistry(),
+      assistantMessageId: message.id,
+      input: 'hi',
+      appendContent: (_) {},
+      appendStatus: (_) {},
+      updateMessage: (updater) => message = updater(message),
+      finishStreaming: () {},
+      completeStreamingUi: () {},
+    );
+
+    final decision = message.metadata?[kHermesDecisionMeta] as Map?;
+    check(decision).isNotNull();
+    check(decision!['state']).equals('resolved');
+  });
+
+  test('a clarify gate without a published timeout expires with its waiter', () async {
+    final fake = _FakeHermesApiService([
+      const HermesDecisionRequested(
+        kind: HermesDecisionKind.clarification,
+        requestId: 'clr-1',
+        prompt: 'Which host?',
+        // The live runs API publishes no `timeout_s`; its waiter still dies at
+        // the gateway's clarify timeout, so the card must not outlive it.
+        raw: {'run_id': 'run-1', 'execution_generation': 4},
+      ),
+      const HermesRunDone(),
+    ]);
+    var message = ChatMessage(
+      id: 'm',
+      role: 'assistant',
+      content: '',
+      timestamp: DateTime.fromMillisecondsSinceEpoch(0),
+    );
+    final before = DateTime.now().toUtc();
+
+    await dispatchHermesRun(
+      service: fake,
+      registry: HermesRunRegistry(),
+      assistantMessageId: message.id,
+      input: 'hi',
+      appendContent: (_) {},
+      appendStatus: (_) {},
+      updateMessage: (updater) => message = updater(message),
+      finishStreaming: () {},
+      completeStreamingUi: () {},
+    );
+
+    final decision = message.metadata?[kHermesDecisionMeta] as Map?;
+    final expiresAt = DateTime.parse(decision!['expiresAt'] as String);
+    final lifetime = expiresAt.difference(before);
+    check(lifetime.inSeconds).isGreaterThan(150);
+    check(lifetime.inSeconds).isLessThan(200);
+  });
+
   test(
     'reasoning status text is bounded, redacted, and control-safe',
     () async {

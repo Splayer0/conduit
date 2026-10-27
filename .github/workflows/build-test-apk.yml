@@ -1,0 +1,75 @@
+name: Build test APK
+
+# Manual + auto on main. Produces a DEBUG APK signed with the debug key,
+# package id app.cogwheel.conduit.debug -- installs ALONGSIDE the official app,
+# no keystore secrets, no uninstall of anything. Grab it from the run's
+# Artifacts. arm64 only (the ABI every current phone uses) to halve build time.
+#
+# The test steps are the real proof: the APK building only shows the Dart
+# compiles, not that clarify events are parsed and projected correctly.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    name: Clarify patch (tests + debug APK)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Fetch third_party submodules
+        run: git submodule update --init --recursive --depth 1 third_party/katex third_party/mermaid
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Generate code (app)
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      - name: Generate code (packages)
+        shell: bash
+        run: |
+          for dir in packages/*/; do
+            if [ -f "${dir}pubspec.yaml" ] && grep -q '^  build_runner:' "${dir}pubspec.yaml"; then
+              echo "::group::build_runner in $dir"
+              (cd "$dir" && dart run build_runner build --delete-conflicting-outputs)
+              echo "::endgroup::"
+            fi
+          done
+
+      # --- the patch's own tests -------------------------------------------
+      - name: Test clarify projection (conduit_core)
+        run: cd packages/conduit_core && dart test test/features/hermes/hermes_stream_parser_test.dart
+
+      - name: Test clarify transport + card (app)
+        run: |
+          flutter test \
+            test/features/hermes/hermes_run_transport_test.dart \
+            test/features/hermes/hermes_api_service_test.dart \
+            test/features/hermes/hermes_decision_card_test.dart
+
+      # --- the artifact ----------------------------------------------------
+      - name: Build debug APK
+        run: flutter build apk --debug --target-platform android-arm64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conduit-clarify-debug-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error

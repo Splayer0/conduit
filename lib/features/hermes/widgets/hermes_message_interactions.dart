@@ -18,6 +18,7 @@ import 'package:conduit_core/features/chat/providers/chat_providers.dart'
 
 import 'package:conduit_core/features/hermes/models/hermes_run_event.dart';
 import 'package:conduit_core/features/hermes/providers/hermes_providers.dart';
+import 'package:conduit_core/features/hermes/services/hermes_api_service.dart';
 import 'package:conduit_core/features/hermes/services/hermes_desktop_api_service.dart';
 import 'package:conduit_core/features/hermes/services/hermes_run_transport.dart';
 
@@ -64,9 +65,12 @@ ChatMessage? findPendingHermesComposerPrompt(List<ChatMessage> messages) {
     final storedSessionId =
         _nonEmptyString(decision['storedSessionId']) ??
         _nonEmptyString(message.metadata?['hermesSessionId']);
+    // Run-scoped questions are answered over the runs API and carry no stored
+    // Desktop session, so only the request and run ids gate their presence.
+    final runScoped = decision['runScoped'] == true;
     if (_nonEmptyString(decision['requestId']) != null &&
         _nonEmptyString(decision['runtimeId']) != null &&
-        storedSessionId != null &&
+        (runScoped || storedSessionId != null) &&
         expiresAt != null &&
         expiresAt.isAfter(clock.now().toUtc())) {
       return message;
@@ -259,7 +263,20 @@ class _HermesComposerPromptOverlayState
     final storedSessionId =
         _nonEmptyString(decision['storedSessionId']) ??
         _nonEmptyString(message.metadata?['hermesSessionId']);
-    if (ownerConversationId == null || storedSessionId == null) {
+    // A run-scoped question is answered straight back to the run that parked
+    // on it, so it needs no stored Desktop session to be presented.
+    // A run-scoped answer is bound to the generation that opened the prompt:
+    // the runs API rejects an answer without it, so a card that cannot answer
+    // is never presented as tappable.
+    final runScoped = decision['runScoped'] == true;
+    final executionGeneration = switch (decision['executionGeneration']) {
+      final int generation when generation >= 0 => generation,
+      _ => null,
+    };
+    if (runScoped) {
+      if (executionGeneration == null) return null;
+      if (ref.read(hermesApiServiceProvider) is! HermesApiService) return null;
+    } else if (ownerConversationId == null || storedSessionId == null) {
       return null;
     }
     _expiryTimer = Timer(expiresAt.difference(clock.now().toUtc()), () {
@@ -276,60 +293,132 @@ class _HermesComposerPromptOverlayState
         _ => const <String>[],
       },
       multiSelect: decision['multiSelect'] == true,
-      onSubmit: (value) async {
-        if (!expiresAt.isAfter(clock.now().toUtc())) return false;
-        final service = ref.read(hermesApiServiceProvider);
-        if (service is! HermesDesktopApiService) return false;
-        final configController = ref.read(hermesConfigProvider.notifier);
-        final admission = configController.captureSessionActionAdmission();
-        if (admission == null ||
-            !_ownsDesktopDecision(
-              service: service,
-              ownerConversationId: ownerConversationId,
-              storedSessionId: storedSessionId,
-            )) {
-          return false;
-        }
-        try {
-          await service.respondToDecision(
-            runtimeId: runtimeId,
-            storedSessionId: storedSessionId,
-            requestId: requestId,
-            kind: kind,
-            value: value,
-            mcpServer: decision['mcpServer']?.toString(),
-            mcpAction: decision['mcpAction']?.toString(),
-          );
-          if (!configController.sessionActionAdmissionIsCurrent(admission) ||
-              !_ownsDesktopDecision(
-                service: service,
-                ownerConversationId: ownerConversationId,
-                storedSessionId: storedSessionId,
-              )) {
-            return false;
-          }
-          ref.read(chatMessagesProvider.notifier).updateMessageById(
-            message.id,
-            (message) {
-              final metadata = Map<String, dynamic>.from(
-                message.metadata ?? const {},
-              );
-              final current = metadata[kHermesDecisionMeta];
-              if (current is Map && current['requestId'] == requestId) {
-                metadata[kHermesDecisionMeta] = {
-                  ...current.cast<String, dynamic>(),
-                  'state': 'resolved',
-                };
-              }
-              return message.copyWith(metadata: metadata);
-            },
-          );
-          return true;
-        } catch (_) {
-          return false;
-        }
-      },
+      onSubmit: runScoped
+          ? (value) => _answerRunScopedDecision(
+              messageId: message.id,
+              runId: runtimeId,
+              requestId: requestId,
+              answer: value,
+              executionGeneration: executionGeneration!,
+              expiresAt: expiresAt,
+            )
+          : (value) => _answerDesktopDecision(
+              messageId: message.id,
+              runtimeId: runtimeId,
+              requestId: requestId,
+              kind: kind,
+              value: value,
+              expiresAt: expiresAt,
+              ownerConversationId: ownerConversationId!,
+              storedSessionId: storedSessionId!,
+              mcpServer: decision['mcpServer']?.toString(),
+              mcpAction: decision['mcpAction']?.toString(),
+            ),
     );
+  }
+
+  /// Answers a run-scoped question over the runs API
+  /// (`POST /v1/runs/{id}/clarify`), which resumes the parked turn.
+  Future<bool> _answerRunScopedDecision({
+    required String messageId,
+    required String runId,
+    required String requestId,
+    required String answer,
+    required int executionGeneration,
+    required DateTime expiresAt,
+  }) async {
+    if (!expiresAt.isAfter(clock.now().toUtc())) return false;
+    final service = ref.read(hermesApiServiceProvider);
+    if (service is! HermesApiService) return false;
+    try {
+      await service.resolveClarify(
+        runId,
+        requestId: requestId,
+        answer: answer,
+        executionGeneration: executionGeneration,
+      );
+    } catch (_) {
+      return false;
+    }
+    ref.read(chatMessagesProvider.notifier).updateMessageById(messageId, (
+      message,
+    ) {
+      final metadata = Map<String, dynamic>.from(message.metadata ?? const {});
+      final current = metadata[kHermesDecisionMeta];
+      if (current is Map && current['requestId'] == requestId) {
+        metadata[kHermesDecisionMeta] = {
+          ...current.cast<String, dynamic>(),
+          'state': 'resolved',
+        };
+      }
+      return message.copyWith(metadata: metadata);
+    });
+    return true;
+  }
+
+  /// Answers a Desktop Gateway decision (`POST /api/desktop/.../respond`).
+  Future<bool> _answerDesktopDecision({
+    required String messageId,
+    required String runtimeId,
+    required String requestId,
+    required HermesDecisionKind kind,
+    required String value,
+    required DateTime expiresAt,
+    required String ownerConversationId,
+    required String storedSessionId,
+    String? mcpServer,
+    String? mcpAction,
+  }) async {
+    if (!expiresAt.isAfter(clock.now().toUtc())) return false;
+    final service = ref.read(hermesApiServiceProvider);
+    if (service is! HermesDesktopApiService) return false;
+    final configController = ref.read(hermesConfigProvider.notifier);
+    final admission = configController.captureSessionActionAdmission();
+    if (admission == null ||
+        !_ownsDesktopDecision(
+          service: service,
+          ownerConversationId: ownerConversationId,
+          storedSessionId: storedSessionId,
+        )) {
+      return false;
+    }
+    try {
+      await service.respondToDecision(
+        runtimeId: runtimeId,
+        storedSessionId: storedSessionId,
+        requestId: requestId,
+        kind: kind,
+        value: value,
+        mcpServer: mcpServer,
+        mcpAction: mcpAction,
+      );
+      if (!configController.sessionActionAdmissionIsCurrent(admission) ||
+          !_ownsDesktopDecision(
+            service: service,
+            ownerConversationId: ownerConversationId,
+            storedSessionId: storedSessionId,
+          )) {
+        return false;
+      }
+      ref.read(chatMessagesProvider.notifier).updateMessageById(messageId, (
+        message,
+      ) {
+        final metadata = Map<String, dynamic>.from(
+          message.metadata ?? const {},
+        );
+        final current = metadata[kHermesDecisionMeta];
+        if (current is Map && current['requestId'] == requestId) {
+          metadata[kHermesDecisionMeta] = {
+            ...current.cast<String, dynamic>(),
+            'state': 'resolved',
+          };
+        }
+        return message.copyWith(metadata: metadata);
+      });
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   @override

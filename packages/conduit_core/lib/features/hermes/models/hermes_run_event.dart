@@ -101,6 +101,17 @@ final class HermesDecisionRequested extends HermesRunEvent {
   final Map<String, dynamic> raw;
 }
 
+/// A decision request was answered, lapsed, or withdrawn, so its card must
+/// stop being tappable.
+final class HermesDecisionSettled extends HermesRunEvent {
+  const HermesDecisionSettled({required this.requestId, this.outcome});
+
+  final String requestId;
+
+  /// Why the gate closed (`settled` / `expire`), when the server says.
+  final String? outcome;
+}
+
 /// A lifecycle transition (created / completed / failed / cancelled / stopping).
 final class HermesLifecycle extends HermesRunEvent {
   const HermesLifecycle(this.status);

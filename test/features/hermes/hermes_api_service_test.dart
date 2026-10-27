@@ -1322,6 +1322,33 @@ void main() {
       });
     });
 
+    test('resolveClarify posts the prompt and its generation', () async {
+      final capture = _CaptureInterceptor({});
+      await _service(capture).resolveClarify(
+        'r1',
+        requestId: 'clr-1',
+        answer: 'the laptop',
+        executionGeneration: 4,
+      );
+
+      final req = capture.requests.single;
+      check(req.path).equals('http://host:8642/v1/runs/r1/clarify');
+      check(req.data as Map<String, dynamic>).deepEquals({
+        'request_id': 'clr-1',
+        'execution_generation': 4,
+        'answer': 'the laptop',
+      });
+    });
+
+    test('resolveClarify refuses to guess a missing generation', () async {
+      final capture = _CaptureInterceptor({});
+      await expectLater(
+        _service(capture).resolveClarify('r1', requestId: 'clr-1', answer: 'x'),
+        throwsA(isA<FormatException>()),
+      );
+      check(capture.requests).isEmpty();
+    });
+
     test('approval identifiers cannot inject URI path or fragments', () async {
       final capture = _CaptureInterceptor({});
       await _service(capture).resolveApproval(

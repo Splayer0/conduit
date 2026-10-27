@@ -254,6 +254,51 @@ void main() {
         ).deepEquals(['once', 'session', 'always', 'deny']);
     });
 
+    test('decodes a clarify gate as a decision request', () async {
+      final events = await parseHermesRunStream(
+        _sse([
+          'data: {"event":"clarify.request","run_id":"run_0123abcdef","timestamp":1720000000.0,"kind":"clarify","prompt_id":"clr-1","execution_generation":4,"question":"Which host should I restart?","choices":["laptop","server"],"multi_select":false,"timeout_s":180}\n\n',
+        ]),
+      ).toList();
+
+      check(events).has((e) => e.length, 'length').equals(1);
+      check(events.single).isA<HermesDecisionRequested>()
+        ..has((e) => e.kind, 'kind').equals(HermesDecisionKind.clarification)
+        ..has((e) => e.requestId, 'requestId').equals('clr-1')
+        ..has((e) => e.prompt, 'prompt').equals('Which host should I restart?')
+        ..has(
+          (e) => e.raw['execution_generation'],
+          'execution generation',
+        ).equals(4);
+    });
+
+    test('does not decode a clarify gate as an approval gate', () async {
+      final events = await parseHermesRunStream(
+        _sse([
+          'data: {"event":"clarify.request","run_id":"run_0123abcdef","prompt_id":"clr-1","question":"Which host?"}\n\n',
+        ]),
+      ).toList();
+
+      check(events.whereType<HermesApprovalRequested>()).isEmpty();
+    });
+
+    test('closes a settled clarify gate instead of reopening it', () async {
+      final events = await parseHermesRunStream(
+        _sse([
+          'data: {"event":"clarify.request","run_id":"run_0123abcdef","prompt_id":"clr-1","question":"Which host?"}\n\n',
+          'data: {"event":"clarify.settled","run_id":"run_0123abcdef","prompt_id":"clr-1","execution_generation":4}\n\n',
+        ]),
+      ).toList();
+
+      check(events.whereType<HermesDecisionRequested>())
+          .has((e) => e.length, 'requests')
+          .equals(1);
+      check(events.last)
+          .isA<HermesDecisionSettled>()
+          .has((e) => e.requestId, 'requestId')
+          .equals('clr-1');
+    });
+
     test('does not decode an answered gate as a new request', () async {
       // Issue #769: the runs API follows an approval with approval.responded
       // (only run_id, choice and resolved), which used to reopen the card.

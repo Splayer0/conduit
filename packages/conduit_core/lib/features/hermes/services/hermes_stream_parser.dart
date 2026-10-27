@@ -371,6 +371,44 @@ Iterable<HermesRunEvent> parseHermesRunFrame(SseFrame frame) sync* {
   // answered card back up until the run ends (issue #769).
   if (_approvalOutcomeEvents.contains(eventType)) return;
 
+  // Clarify gate: a parked question the run blocks on until a human answers.
+  // Unlike an approval it is scoped to its own prompt id (never the run), and
+  // its answer has to ride back with the generation that opened it, so the raw
+  // payload is preserved for the transport to persist with the card.
+  if (eventType == 'clarify.settled' ||
+      eventType == 'clarify.expire' ||
+      eventType == 'clarify.expired') {
+    final settledId = validateHermesOpaqueIdentifier(
+      data['prompt_id'] ?? data['request_id'] ?? data['id'],
+    );
+    if (settledId != null) {
+      final outcome = eventType == 'clarify.settled'
+          ? 'settled'
+          : eventType == 'clarify.expire'
+          ? 'expire'
+          : 'expired';
+      yield HermesDecisionSettled(requestId: settledId, outcome: outcome);
+    }
+    return;
+  }
+  if (eventType == 'clarify.request' || eventType == 'clarify.requested') {
+    final clarifyId = validateHermesOpaqueIdentifier(
+      data['prompt_id'] ?? data['request_id'] ?? data['id'],
+    );
+    if (clarifyId != null) {
+      yield HermesDecisionRequested(
+        kind: HermesDecisionKind.clarification,
+        requestId: clarifyId,
+        prompt:
+            _strictString(data['question']) ??
+            _strictString(data['prompt']) ??
+            _strictString(data['message']),
+        raw: data,
+      );
+    }
+    return;
+  }
+
   // Human-approval gate.
   if ((eventType?.contains('approval') ?? false) ||
       data.containsKey('approval_id') ||

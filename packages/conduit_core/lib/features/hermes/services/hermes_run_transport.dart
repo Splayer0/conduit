@@ -1406,6 +1406,28 @@ void _handleEvent(
               prompt,
               sensitiveValues: sensitiveValues,
             );
+      // A clarify prompt is bound to the execution generation that opened it:
+      // `POST /v1/runs/{id}/clarify` rejects an answer without it. The deadline
+      // is the server's own clarify timeout when it publishes one, so a card
+      // never stays tappable past the waiter that would accept it.
+      final rawGeneration = raw['execution_generation'];
+      final executionGeneration = rawGeneration is int && rawGeneration >= 0
+          ? rawGeneration
+          : null;
+      final rawTimeout = raw['timeout_s'];
+      final timeoutSeconds = rawTimeout is num && rawTimeout > 0
+          ? rawTimeout.toInt().clamp(1, 24 * 60 * 60)
+          : null;
+      // The runs API publishes no `timeout_s`, but its clarify waiter still
+      // dies at the gateway's clarify timeout (180s by default). An approval
+      // card can sit for a day because a chat turn re-asks; a clarify card
+      // that outlived its waiter would only fail on tap, so it gets the
+      // default waiter lifetime instead.
+      final lifetime = timeoutSeconds != null
+          ? Duration(seconds: timeoutSeconds)
+          : kind == HermesDecisionKind.clarification
+          ? const Duration(minutes: 3)
+          : const Duration(hours: 24);
       updateMessage((message) {
         final metadata = Map<String, dynamic>.from(
           message.metadata ?? const {},
@@ -1415,6 +1437,10 @@ void _handleEvent(
           'kind': kind.name,
           'requestId': safeRequestId,
           'runtimeId': safeRuntimeId,
+          // Run-scoped: the card answers through the runs API rather than the
+          // Desktop decision channel.
+          'runScoped': true,
+          'executionGeneration': ?executionGeneration,
           'prompt': ?safePrompt,
           if (kind == HermesDecisionKind.clarification) ...{
             if (raw['choices'] is List)
@@ -1431,10 +1457,27 @@ void _handleEvent(
               _ => null,
             },
           },
-          'expiresAt': DateTime.now()
-              .add(const Duration(hours: 24))
-              .toUtc()
-              .toIso8601String(),
+          'expiresAt': DateTime.now().add(lifetime).toUtc().toIso8601String(),
+        };
+        return message.copyWith(metadata: metadata);
+      });
+
+    case HermesDecisionSettled(:final requestId):
+      updateMessage((message) {
+        final metadata = Map<String, dynamic>.from(
+          message.metadata ?? const {},
+        );
+        final decision = metadata[kHermesDecisionMeta];
+        if (decision is! Map || decision['requestId'] != requestId) {
+          return message;
+        }
+        if (decision['state'] != 'pending' &&
+            decision['state'] != 'resolving') {
+          return message;
+        }
+        metadata[kHermesDecisionMeta] = <String, dynamic>{
+          ...decision.cast<String, dynamic>(),
+          'state': 'resolved',
         };
         return message.copyWith(metadata: metadata);
       });
@@ -1520,8 +1563,22 @@ List<String> _boundedHermesDecisionChoices(Object? value) {
   if (value is! Iterable) return const <String>[];
   return [
     for (final item in value.take(8))
-      ?validateHermesBoundedString(item, maxCharacters: 80),
+      ?_hermesChoiceLabel(validateHermesBoundedString(item, maxCharacters: 80)),
   ];
+}
+
+/// The clarify tool annotates its recommended choice with a trailing
+/// " (Recommended)" marker. That is rendering advice for a human, not part of
+/// the answer, so the chip shows the plain label and the run receives it too.
+const String _hermesRecommendedSuffix = ' (Recommended)';
+
+String? _hermesChoiceLabel(String? choice) {
+  if (choice == null) return null;
+  if (!choice.endsWith(_hermesRecommendedSuffix)) return choice;
+  final label = choice
+      .substring(0, choice.length - _hermesRecommendedSuffix.length)
+      .trimRight();
+  return label.isEmpty ? choice : label;
 }
 
 String _sanitizeHermesToolName(
